@@ -37,3 +37,5 @@ print("NMI matrix:\n", nmi)
 np.fill_diagonal(fused, 0)  # 将融合矩阵的对角线设为 0
 sil = metrics.silhouette_score(fused, fused_labels)
 print('Silhouette score for the fused matrix is: {:.2f}'.format(sil))
+
+
