@@ -316,116 +316,95 @@ def _B0_normalized(W, alpha=1.0):
     return W
 
 
-def snf(*aff, K=20, t=20, alpha=1.0):
-    r"""
-    Performs Similarity Network Fusion on `aff` matrices
+import numpy as np
 
-    Parameters
-    ----------
-    *aff : (N, N) array_like
-        Input similarity arrays; all arrays should be square and of equal size.
-    K : (0, N) int, optional
-        Hyperparameter normalization factor for scaling. Default: 20
-    t : int, optional
-        Number of iterations to perform information swapping. Default: 20
-    alpha : (0, 1) float, optional
-        Hyperparameter normalization factor for scaling. Default: 1.0
-
-    Returns
-    -------
-    W: (N, N) np.ndarray
-        Fused similarity network of input arrays
-
-    Notes
-    -----
-    In order to fuse the supplied :math:`m` arrays, each must be normalized. A
-    traditional normalization on an affinity matrix would suffer from numerical
-    instabilities due to the self-similarity along the diagonal; thus, a
-    modified normalization is used:
-
-    .. math::
-
-       \mathbf{P}(i,j) =
-         \left\{\begin{array}{rr}
-           \frac{\mathbf{W}_(i,j)}
-                 {2 \sum_{k\neq i}^{} \mathbf{W}_(i,k)} ,& j \neq i \\
-                                                       1/2 ,& j = i
-         \end{array}\right.
-
-    Under the assumption that local similarities are more important than
-    distant ones, a more sparse weight matrix is calculated based on a KNN
-    framework:
-
-    .. math::
-
-       \mathbf{S}(i,j) =
-         \left\{\begin{array}{rr}
-           \frac{\mathbf{W}_(i,j)}
-                 {\sum_{k\in N_{i}}^{}\mathbf{W}_(i,k)} ,& j \in N_{i} \\
-                                                         0 ,& \text{otherwise}
-         \end{array}\right.
-
-    The two weight matrices :math:`\mathbf{P}` and :math:`\mathbf{S}` thus
-    provide information about a given patient's similarity to all other
-    patients and the `K` most similar patients, respectively.
-
-    These :math:`m` matrices are then iteratively fused. At each iteration, the
-    matrices are made more similar to each other via:
-
-    .. math::
-
-       \mathbf{P}^{(v)} = \mathbf{S}^{(v)}
-                          \times
-                          \frac{\sum_{k\neq v}^{}\mathbf{P}^{(k)}}{m-1}
-                          \times
-                          (\mathbf{S}^{(v)})^{T},
-                          v = 1, 2, ..., m
-
-    After each iteration, the resultant matrices are normalized via the
-    equation above. Fusion stops after `t` iterations, or when the matrices
-    :math:`\mathbf{P}^{(v)}, v = 1, 2, ..., m` converge.
-
-    The output fused matrix is full rank and can be subjected to clustering and
-    classification.
+def _calculate_contrastive_gradient(aff, current_index):
     """
+    计算给定相似性矩阵的对比损失梯度。
 
+    参数
+    ----------
+    aff : list of np.ndarray
+        当前状态下的相似性矩阵列表。
+    current_index : int
+        当前相似性矩阵的索引。
+
+    返回
+    -------
+    gradient : np.ndarray
+        当前相似性矩阵对应的对比损失梯度。
+    """
+    current_aff = aff[current_index]
+    other_aff = aff[(current_index + 1) % len(aff)]
+
+    # 获取样本数量
+    num_samples = current_aff.shape[0]
+
+    # 计算相似性矩阵
+    sim_matrix = current_aff @ other_aff.T
+
+    # 对角线为正样本相似性
+    sim_ii = np.diag(sim_matrix)
+
+    # 选择负样本：随机选择一个其他样本的索引
+    negative_indices = np.random.choice(num_samples, num_samples, replace=False)
+    sim_ij = sim_matrix[np.arange(num_samples), negative_indices]
+
+    # 使用数值稳定的 softmax 公式计算分母
+    max_sim = np.maximum(sim_ii, sim_ij)
+    denom = np.exp(sim_ii - max_sim) + np.exp(sim_ij - max_sim)
+
+    # 计算梯度矩阵
+    gradient = np.zeros_like(current_aff)
+
+    for i in range(num_samples):
+        # 计算正样本梯度
+        grad_ii = -(np.exp(sim_ii[i] - max_sim[i]) / denom[i]) * other_aff[i]
+
+        # 计算负样本梯度
+        j = negative_indices[i]
+        grad_ij = (np.exp(sim_ij[i] - max_sim[i]) / denom[i]) * other_aff[j]
+
+        # 更新梯度
+        gradient[i] += grad_ii + grad_ij
+
+    return gradient
+
+
+
+
+def snf(*aff, K=20, t=20, alpha=1.0, eta=0.3):
     aff = _check_SNF_inputs(aff)
     Wk = [0] * len(aff)
     Wsum = np.zeros(aff[0].shape)
-
-    # get number of modalities informing each subject x subject affinity
-    n_aff = len(aff) - np.sum([np.isnan(a) for a in aff], axis=0)
+    n_aff = len(aff)
 
     for n, mat in enumerate(aff):
-        # normalize affinity matrix based on strength of edges
         mat = mat / np.nansum(mat, axis=1, keepdims=True)
         aff[n] = check_symmetric(mat, raise_warning=False)
-        # apply KNN threshold to normalized affinity matrix
         Wk[n] = _find_dominate_set(aff[n], int(K))
 
-    # take sum of all normalized (not thresholded) affinity matrices
     Wsum = np.nansum(aff, axis=0)
 
     for iteration in range(t):
+        new_aff = []
         for n, mat in enumerate(aff):
-            # temporarily convert nans to 0 to avoid propagation errors
             nzW = np.nan_to_num(Wk[n])
             aw = np.nan_to_num(mat)
-            # propagate `Wsum` through masked affinity matrix (`nzW`)
-            aff0 = nzW @ (Wsum - aw) @ nzW.T / (n_aff - 1)  # TODO: / by 0
-            # ensure diagonal retains highest similarity
-            aff[n] = _B0_normalized(aff0, alpha=alpha)
+            aff0 = nzW @ (Wsum - aw) @ nzW.T / max(n_aff - 1, 1)  # 避免除零
 
-        # compute updated sum of normalized affinity matrices
+            contrastive_grad = _calculate_contrastive_gradient(aff, n)
+            if contrastive_grad.shape != aff0.shape:
+                raise ValueError(f"对比损失梯度的形状 {contrastive_grad.shape} 与相似性矩阵的形状 {aff0.shape} 不匹配。")
+
+            updated_mat = _B0_normalized(aff0 - eta * contrastive_grad, alpha=alpha)
+            new_aff.append(updated_mat)
+
+        aff = new_aff
         Wsum = np.nansum(aff, axis=0)
 
-    # all entries of `aff` should be identical after the fusion procedure
-    # dividing by len(aff) is hypothetically equivalent to selecting one
-    # however, if fusion didn't converge then this is just average of `aff`
     W = Wsum / len(aff)
-
-    # normalize fused matrix and update diagonal similarity
-    W = W / np.nansum(W, axis=1, keepdims=True)  # TODO: / by NaN
+    W = W / np.nansum(W, axis=1, keepdims=True)
     W = (W + W.T + np.eye(len(W))) / 2
 
     return W
